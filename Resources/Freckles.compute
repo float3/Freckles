@@ -1,0 +1,156 @@
+﻿#include <UnityCG.cginc>
+
+float2 hash2(float2 p)
+{
+    return frac(sin(float2(dot(p, float2(127.1, 311.7)), dot(p, float2(269.5, 183.3)))) * 43758.5453);
+}
+
+float2 voronoiT2(float2 x, float angle, out float2 cellPoints)
+{
+    const float2 n = floor(x);
+    const float2 f = frac(x);
+    float2 mr;
+    float2 cellID = 0;
+
+    float md = 8.0;
+    for (int j = -1; j <= 1; j++)
+    {
+        for (int k = -1; k <= 1; k++)
+        {
+            const float2 g = float2(k, j);
+            float2 o = hash2(n + g);
+            o = sin(o * angle * UNITY_HALF_PI) * 0.5 + 0.5;
+            const float2 r = g + o - f;
+            const float d = dot(r, r);
+
+            UNITY_FLATTEN
+            if (d < md)
+            {
+                md = d;
+                mr = r;
+                cellID = n + g;
+            }
+        }
+    }
+    cellPoints = mr;
+    return cellID;
+}
+
+float3 GammaToLinear(float3 srgb)
+{
+    float3 lin;
+    lin.x = srgb.x <= 0.04045 ? srgb.x / 12.92 : pow((srgb.x + 0.055) / 1.055, 2.5);
+    lin.y = srgb.y <= 0.04045 ? srgb.y / 12.92 : pow((srgb.y + 0.055) / 1.055, 2.5);
+    lin.z = srgb.z <= 0.04045 ? srgb.z / 12.92 : pow((srgb.z + 0.055) / 1.055, 2.5);
+    return lin;
+}
+
+float3 LinearToGamma(float3 lin)
+{
+    float3 srgb;
+    srgb.x = lin.x <= 0.0031308 ? lin.x * 12.92 : 1.055 * pow(lin.x, 1.0 / 2.4) - 0.055;
+    srgb.y = lin.y <= 0.0031308 ? lin.y * 12.92 : 1.055 * pow(lin.y, 1.0 / 2.4) - 0.055;
+    srgb.z = lin.z <= 0.0031308 ? lin.z * 12.92 : 1.055 * pow(lin.z, 1.0 / 2.4) - 0.055;
+
+    return srgb;
+}
+
+Texture2D<float4> Input;
+RWTexture2D<float4> Result;
+
+float4 _FreckleBounds;
+bool _FreckleMask;
+float _FreckleScale;
+float _FreckleSize;
+float _FreckleRandomness;
+float _FreckleAmount;
+float _FreckleRoundness;
+
+bool _sRGB;
+
+#pragma kernel freckles
+[numthreads(8,8,1)]
+void freckles(uint3 id : SV_DispatchThreadID)
+{
+    float3 input = Input[id.xy].xyz;
+    float3 result = input;
+
+    uint width, heigth;
+    Input.GetDimensions(width, heigth);
+    float2 uvs = (id.xy / (float)uint2(width, heigth));
+    float2 maskingUVs = uvs;
+    float ratio = (_FreckleBounds.y - _FreckleBounds.x) / (_FreckleBounds.w - _FreckleBounds.z);
+    
+    if (maskingUVs.x > _FreckleBounds.x && maskingUVs.x < _FreckleBounds.y && maskingUVs.y > _FreckleBounds.z &&
+        maskingUVs.y < _FreckleBounds.w)
+    {
+        maskingUVs.x -= _FreckleBounds.x;
+        maskingUVs.x *= 1 / (_FreckleBounds.y - _FreckleBounds.x);
+        maskingUVs.y -= _FreckleBounds.z;
+        maskingUVs.y *= 1 / (_FreckleBounds.w - _FreckleBounds.z);
+
+        float2 cellPoints;
+        float2 cellID = voronoiT2(uvs * (float2(ratio, 1) * _FreckleScale), 6, cellPoints);
+
+        float2 nosemaskUVs = maskingUVs;
+        nosemaskUVs.x *= 1.6;
+        nosemaskUVs.x -= 1.6 / 2;
+        nosemaskUVs.y -= 0.1;
+
+        float nosemask = smoothstep(0.47, 0.47 * 0.75, length(nosemaskUVs));
+        nosemaskUVs = maskingUVs;
+        nosemaskUVs.x -= 0.34;
+        nosemaskUVs.x *= 1.9;
+        nosemaskUVs.x -= 1.9 / 2;
+        nosemaskUVs.y -= 1.08;
+        nosemask += smoothstep(0.58, 0.58 * 0.75, length(nosemaskUVs));
+
+        nosemaskUVs.x = maskingUVs.x;
+        nosemaskUVs.x += 0.34;
+        nosemaskUVs.x *= 1.9;
+        nosemaskUVs.x -= 1.9 / 2;
+        nosemask += smoothstep(0.58, 0.58 * 0.75, length(nosemaskUVs));
+
+        float2 outermaskUVs = maskingUVs;
+        outermaskUVs.x = smoothstep(0.32 * 2, 0.75, abs(outermaskUVs.x - 0.5) * 1.5);
+        outermaskUVs.y = smoothstep(0.25, 0.5, abs(outermaskUVs.y - 0.5));
+        const float outermask = max(outermaskUVs.x, outermaskUVs.y);
+
+
+        float maskmask = 1 - max(nosemask, outermask);
+        maskmask = lerp(maskmask, 1, _FreckleBounds.x == 0);
+        if (!_FreckleMask)
+        {
+            maskmask = 1;
+        }
+        float2 randomCell = saturate(hash2(cellID.xy + _FreckleRandomness));
+
+        const float randomCellXForUse = randomCell.x * (1 / _FreckleAmount);
+        float freckleRoundnessScale = 1 - _FreckleRoundness + 1.0;
+        const float2 freckleRoundness = lerp(float2(freckleRoundnessScale, 1), float2(1, freckleRoundnessScale),
+                                             randomCellXForUse);
+
+        float cellP = length(cellPoints * freckleRoundness);
+        cellP = smoothstep(_FreckleSize * 1.5, _FreckleSize * 0.6, cellP);
+
+        float cellCutoff = randomCell.x >= 1 - _FreckleAmount;
+        const float asd = cellCutoff.x * cellP * smoothstep(0, 0.1, maskmask);
+
+        float3 das = float3(196, 102, 58) / 255.0;
+        das = lerp(das, float3(153, 79, 44) / 255.0, randomCell.x);
+
+        das *= lerp(1, input, 0.3333);
+
+        das = lerp(input, das, asd * randomCell.y);
+
+        result = das;
+    }
+
+    if (_sRGB)
+    {
+        // why is GammaToLinear correct? I thought it should be the other way around
+        result = GammaToLinear(result);
+    }
+    
+    Result[id.xy] = float4(result, Input[id.xy].w);
+}
